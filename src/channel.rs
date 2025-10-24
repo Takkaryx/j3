@@ -1,13 +1,19 @@
+use crate::{
+    executor::wake_task,
+    future::{OurFuture, Poll},
+};
 use core::cell::Cell;
 
 pub struct Channel<T> {
     item: Cell<Option<T>>,
+    task_id: Cell<Option<usize>>,
 }
 
 impl<T> Channel<T> {
     pub fn new() -> Self {
         Self {
             item: Cell::new(None),
+            task_id: Cell::new(None),
         }
     }
 
@@ -16,15 +22,25 @@ impl<T> Channel<T> {
     }
 
     pub fn get_reciever(&self) -> Receiver<'_, T> {
-        Receiver { channel: &self }
+        Receiver {
+            channel: &self,
+            state: ReceiverState::Init,
+        }
     }
 
     fn send(&self, item: T) {
         self.item.replace(Some(item));
+        if let Some(task_id) = self.task_id.get() {
+            wake_task(task_id);
+        }
     }
 
     fn recieve(&self) -> Option<T> {
         self.item.take()
+    }
+
+    fn register(&self, task_id: usize) {
+        self.task_id.replace(Some(task_id));
     }
 }
 
@@ -38,12 +54,29 @@ impl<T> Sender<'_, T> {
     }
 }
 
-pub struct Receiver<'a, T> {
-    channel: &'a Channel<T>,
+enum ReceiverState {
+    Init,
+    Wait,
 }
 
-impl<T> Receiver<'_, T> {
-    pub fn receive(&self) -> Option<T> {
-        self.channel.recieve()
+pub struct Receiver<'a, T> {
+    channel: &'a Channel<T>,
+    state: ReceiverState,
+}
+
+impl<T> OurFuture for Receiver<'_, T> {
+    type Output = T;
+    fn poll(&mut self, task_id: usize) -> Poll<Self::Output> {
+        match self.state {
+            ReceiverState::Init => {
+                self.channel.register(task_id);
+                self.state = ReceiverState::Wait;
+                Poll::Pending
+            }
+            ReceiverState::Wait => match self.channel.recieve() {
+                Some(item) => Poll::Ready(item),
+                None => Poll::Pending,
+            },
+        }
     }
 }
