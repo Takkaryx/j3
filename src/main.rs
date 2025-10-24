@@ -4,26 +4,31 @@
 mod button;
 mod channel;
 mod executor;
-mod future;
 mod gpiote;
 mod led;
 mod time;
 
-use crate::future::OurFuture;
-use channel::Channel;
+use button::ButtonDirection;
+use channel::{Channel, Receiver, Sender};
+use gpiote::InputChannel;
+use led::LedRow;
 use time::Ticker;
 
+use core::pin::pin;
 use cortex_m_rt::entry;
-use embedded_hal::digital::OutputPin;
-use microbit::Board;
-use microbit::hal::gpiote::Gpiote;
+use embedded_hal::digital::{OutputPin, PinState};
+use fugit::ExtU64;
+use futures::{FutureExt, select_biased};
+use microbit::{
+    Board,
+    gpio::NUM_COLS,
+    hal::{
+        gpio::{Floating, Input, Output, Pin, PushPull},
+        gpiote::Gpiote,
+    },
+};
 use panic_halt as _;
 use rtt_target::rtt_init_print;
-
-use crate::{
-    button::{ButtonDirection, ButtonTask},
-    led::LedTask,
-};
 
 #[entry]
 fn main() -> ! {
@@ -38,22 +43,51 @@ fn main() -> ! {
     let button_r = board.buttons.button_b.degrade();
 
     let channel: Channel<ButtonDirection> = Channel::new();
-    let mut led_task = LedTask::new(col, channel.get_reciever());
-    let mut button_l_task = ButtonTask::new(
+    let led_task = pin!(led_task(col, channel.get_reciever()));
+    let button_l_task = pin!(button_task(
         button_l,
         ButtonDirection::Left,
         channel.get_sender(),
         &gpiote,
-    );
-    let mut button_r_task = ButtonTask::new(
+    ));
+    let button_r_task = pin!(button_task(
         button_r,
         ButtonDirection::Right,
         channel.get_sender(),
         &gpiote,
-    );
+    ));
 
-    let mut tasks: [&mut dyn OurFuture<Output = ()>; 3] =
-        [&mut led_task, &mut button_l_task, &mut button_r_task];
+    executor::run_tasks(&mut [led_task, button_l_task, button_r_task]);
+}
 
-    executor::run_tasks(&mut tasks);
+async fn led_task(
+    col: [Pin<Output<PushPull>>; NUM_COLS],
+    mut receiver: Receiver<'_, ButtonDirection>,
+) {
+    let mut blinker = LedRow::new(col);
+    loop {
+        blinker.toggle();
+        select_biased! {
+            direction = receiver.receive().fuse() => {
+                blinker.shift(direction);
+            }
+            _ = time::delay(500.millis()).fuse() => {}
+        }
+    }
+}
+
+async fn button_task(
+    pin: Pin<Input<Floating>>,
+    direction: ButtonDirection,
+    sender: Sender<'_, ButtonDirection>,
+    gpiote: &Gpiote,
+) {
+    let mut input = InputChannel::new(pin, gpiote);
+
+    loop {
+        input.wait_for(PinState::Low).await;
+        sender.send(direction);
+        time::delay(100.millis()).await;
+        input.wait_for(PinState::High).await
+    }
 }

@@ -1,4 +1,8 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    future::poll_fn,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::Poll,
+};
 use embedded_hal::digital::{InputPin, PinState};
 use microbit::{
     hal::{
@@ -8,10 +12,7 @@ use microbit::{
     pac::{Interrupt, NVIC, interrupt},
 };
 
-use crate::{
-    executor::wake_task,
-    future::{OurFuture, Poll},
-};
+use crate::executor::{ExtWaker, wake_task};
 
 const MAX_CHANNELS_USED: usize = 2;
 static NEXT_CHANNEL: AtomicUsize = AtomicUsize::new(0);
@@ -23,7 +24,6 @@ static WAKE_TASKS: [AtomicUsize; MAX_CHANNELS_USED] = [DEFAULT_TASK; MAX_CHANNEL
 pub struct InputChannel {
     pin: Pin<Input<Floating>>,
     channel_id: usize,
-    ready_state: PinState,
 }
 
 impl InputChannel {
@@ -36,28 +36,19 @@ impl InputChannel {
         };
         channel.input_pin(&pin).toggle().enable_interrupt();
         unsafe { NVIC::unmask(Interrupt::GPIOTE) };
-        Self {
-            pin,
-            channel_id,
-            ready_state: PinState::Low,
-        }
+        Self { pin, channel_id }
     }
 
-    pub fn set_ready_state(&mut self, ready_state: PinState) {
-        self.ready_state = ready_state;
-    }
-}
-
-impl OurFuture for InputChannel {
-    type Output = ();
-
-    fn poll(&mut self, task_id: usize) -> Poll<Self::Output> {
-        if self.ready_state == PinState::from(self.pin.is_high().unwrap()) {
-            Poll::Ready(())
-        } else {
-            WAKE_TASKS[self.channel_id].store(task_id, Ordering::Relaxed);
-            Poll::Pending
-        }
+    pub async fn wait_for(&mut self, ready_state: PinState) {
+        poll_fn(|cx| {
+            if ready_state == PinState::from(self.pin.is_high().unwrap()) {
+                Poll::Ready(())
+            } else {
+                WAKE_TASKS[self.channel_id].store(cx.waker().task_id(), Ordering::Relaxed);
+                Poll::Pending
+            }
+        })
+        .await
     }
 }
 
